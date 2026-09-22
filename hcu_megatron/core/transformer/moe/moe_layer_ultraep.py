@@ -53,15 +53,16 @@ class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
     """Finishes EPLB replica grad-reduce and registers master param grads as DDP-ready."""
 
     @staticmethod
-    def forward(ctx, hidden_states, moe_layer):
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
         ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_output):
-        ctx.moe_layer._eplb_finish_grad_reduce()
+        ctx.moe_layer._eplb_finish_grad_reduce(ctx.virtual_layer_id)
         ctx.moe_layer._eplb_register_master_grad_ready()
-        return grad_output, None
+        return grad_output, None, None
 
 
 class _EPLBWeightSyncFunction(torch.autograd.Function):
@@ -258,16 +259,29 @@ def _eplb_register_master_experts(self):
 
 def _eplb_start_grad_reduce(self, virtual_layer_id: int, async_finish: bool = True):
     # HCU BLOCKER: calls ultra_ep._C grad_reduce
-    self._eplb_grad_reduce_event_handle = self.eplb_manager.runtime.grad_reduce(
-        layer_id=virtual_layer_id,
-        async_finish=async_finish,
+    assert virtual_layer_id not in self._eplb_grad_reduce_event_handles, (
+        "UltraEP Grad Reduce was launched twice for one virtual layer"
+    )
+    self._eplb_grad_reduce_event_handles[virtual_layer_id] = (
+        self.eplb_manager.runtime.grad_reduce(
+            layer_id=virtual_layer_id,
+            async_finish=async_finish,
+        )
     )
 
 
-def _eplb_finish_grad_reduce(self):
-    if self._eplb_grad_reduce_event_handle is not None:
-        self._eplb_grad_reduce_event_handle.current_stream_wait()
-        self._eplb_grad_reduce_event_handle = None
+def _eplb_finish_grad_reduce(self, virtual_layer_id: int):
+    event_handle = self._eplb_grad_reduce_event_handles.pop(
+        virtual_layer_id, None
+    )
+    if event_handle is not None:
+        wait_grad_reduce = getattr(
+            self.eplb_manager.runtime, "wait_grad_reduce", None
+        )
+        if wait_grad_reduce is None:
+            event_handle.current_stream_wait()
+        else:
+            wait_grad_reduce(event_handle, layer_id=virtual_layer_id)
 
 
 def _eplb_register_master_grad_ready(self):
@@ -338,7 +352,7 @@ def moe_layer_ultraep_init_wrapper(moe_layer_init_func):
             self.local_physical_expert_indices = (
                 self.eplb_manager.local_physical_expert_indices
             )
-            self._eplb_grad_reduce_event_handle = None
+            self._eplb_grad_reduce_event_handles = {}
             self._eplb_weight_sync_event_handle = None
             self._eplb_master_ptrs_registered = False
 
@@ -412,7 +426,7 @@ def moe_layer_ultraep_forward_wrapper(moe_layer_forward_func):
             # StartFunction.backward (reverse order), ensuring grad_reduce
             # completes before DDP sees master grads as ready.
             hidden_states = _EPLBReplicaGradReduceFinishFunction.apply(
-                hidden_states, self
+                hidden_states, self, virtual_layer_id
             )
 
             shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -442,19 +456,29 @@ def moe_layer_ultraep_forward_wrapper(moe_layer_forward_func):
             # preprocess, dtoh_stream only waits for the reroute kernel, not weight_sync.
             hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
-            # Wait for weight sync before dispatch (token AllToAll) — replicas must be
-            # ready before experts run.
-            if self._eplb_weight_sync_event_handle is not None:
-                self._eplb_weight_sync_event_handle.current_stream_wait()
-                self._eplb_weight_sync_event_handle = None
-
-            # Wrap input to trigger replica grad-reduce after MoE backward.
+            # Mark the autograd boundary before token dispatch.
             hidden_states = _EPLBReplicaGradReduceStartFunction.apply(
                 hidden_states, self, virtual_layer_id
             )
 
+            # dispatch 只读取 token、路由和概率，不读取 expert 权重。
+            # 此时可以让它与 UltraEP 的异步 weight sync 并行。
             dispatched_input, probs = self.dispatch(hidden_states, probs)
-            # HCU routed_experts_compute takes 2 args (no residual).
+
+            # 专家 GEMM 才会读取（可能刚同步完成的）副本权重。
+            if self._eplb_weight_sync_event_handle is not None:
+                wait_weight_sync = getattr(
+                    self.eplb_manager.runtime, "wait_weight_sync", None
+                )
+                if wait_weight_sync is None:
+                    self._eplb_weight_sync_event_handle.current_stream_wait()
+                else:
+                    wait_weight_sync(
+                        self._eplb_weight_sync_event_handle,
+                        layer_id=virtual_layer_id,
+                    )
+                self._eplb_weight_sync_event_handle = None
+
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
             # HCU combine has no shared_expert_output arg.
             output = self.combine(output)

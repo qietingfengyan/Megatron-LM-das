@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 def _param_and_grad_buffer_init_wrapper(_param_and_grad_buffer_init_func):
+    """Shared wrapper for feature-specific _ParamAndGradBuffer input handling.
+
+    Keep additional parameter-list transformations in this wrapper instead of
+    defining another wrapper for the same initializer.
+    """
     @wraps(_param_and_grad_buffer_init_func)
     def wrapper(self, *args, **kwargs):
         # Filter out replica expert params so they are not assigned to DDP gradient buckets.

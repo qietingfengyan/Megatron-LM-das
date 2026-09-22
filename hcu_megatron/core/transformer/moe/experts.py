@@ -23,8 +23,8 @@ from megatron.core.typed_torch import apply_module
 from hcu_megatron.training.arguments import get_adaptor_args
 
 
-def te_grouped_linear_sharded_state_dict_ultraep_wrapper(original_func):
-    """Emit only master experts and logical EP metadata for UltraEP."""
+def te_grouped_linear_sharded_state_dict_wrapper(original_func):
+    """Emit only master experts and logical EP metadata when replicas exist."""
     from functools import wraps
 
     @wraps(original_func)
@@ -43,7 +43,7 @@ def te_grouped_linear_sharded_state_dict_ultraep_wrapper(original_func):
     return wrapper
 
 
-def teg_grouped_mlp_sharded_state_dict_ultraep_wrapper(original_func):
+def te_grouped_mlp_sharded_state_dict_wrapper(original_func):
     """Restore logical local expert count while constructing a dist checkpoint."""
     from functools import wraps
     import re

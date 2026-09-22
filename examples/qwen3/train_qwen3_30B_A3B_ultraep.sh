@@ -1,32 +1,5 @@
 #!/bin/bash
 
-# 拓扑与 rocSHMEM：必需
-export HSA_USE_SVM=0 # runtime和dtk那边的一个遗留bug的临时解决方案
-export MAX_NUM_NVL_PEERS=8 # 与ep对齐
-# export ROCSHMEM_BACKEND=ipc
-# unset ROCSHMEM_GDA_PROVIDER
-export ROCSHMEM_BACKEND=gda
-export ROCSHMEM_GDA_PROVIDER=shca
-export ROCSHMEM_HEAP_SIZE=2147483648
-
-# 单节点的已验证性能配置
-export ULTRA_EP_WEIGHT_SYNC_PLAN_MODE=direct
-export ULTRA_EP_WEIGHT_SYNC_HIP_COPY_MODE=thread        #default
-# export ULTRA_EP_WEIGHT_SYNC_HIP_COPY_MODE=lds           #调优
-# export ULTRA_EP_WEIGHT_SYNC_LDS_WAVES_PER_DEST=2        #调优
-export ULTRA_EP_WEIGHT_SYNC_THREADS_PER_BLOCK=128
-export ULTRA_EP_WEIGHT_SYNC_CTA_MULTIPLIER=2
-
-export ULTRA_EP_GRAD_REDUCE_NUM_SMS=48
-export ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1
-
-# Placement 配置
-# ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA: 允许创建副本所需的最少 token 数/副本。
-# 论文测试用 8k tokens/rank；本配置 seq=4096/8GPU=512 tokens/rank，需要相应调小。
-export ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA=64
-export ULTRA_EP_QUOTA_KERNEL_STAGE=1
-export ULTRA_EP_QUOTA_LOCALITY_AWARE=1
-export ULTRA_EP_BALANCE_THRESHOLD=1.0
 
 INITIALIZATION_ARGS=( --num-workers 2)
 for para in $*
@@ -78,7 +51,6 @@ CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATH=$( dirname $( dirname ${CURRENT_DIR}))
 
 # default env
-# export GPU_MAX_HW_QUEUES=4
 export GLOG_minloglevel=3
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HSA_FORCE_FINE_GRAIN_PCIE=1
@@ -104,6 +76,13 @@ MAX_POSITION_EMBEDDINGS=40960
 # train iteration hyperparameters
 TRAIN_ITERS=50
 LR_WARMUP_ITERS=1
+
+# 拓扑与 rocSHMEM：建议必需（ultraep）
+export HSA_USE_SVM=0 # runtime和dtk那边的一个遗留bug的临时解决方案
+export MAX_NUM_NVL_PEERS=8 # 单个节点/高速互联域内属于当前 EP group 的 rank 数
+export ROCSHMEM_BACKEND=gda # 机内default：ipc
+export ROCSHMEM_GDA_PROVIDER=shca # 机内default： unset ROCSHMEM_GDA_PROVIDER
+export ROCSHMEM_HEAP_SIZE=2147483648 # 小了报错
 
 MPI_DISTRIBUTED_ARGS=(
     --rank ${RANK}
@@ -179,8 +158,9 @@ MOE_ARGS=(
     --moe-router-fusion
     # --moe-router-force-load-balancing
     # ultraep
-    --moe-enable-ultraep  
-    --moe-num-redundant-experts-per-rank 2 
+    --moe-enable-ultraep
+    --moe-num-redundant-experts-per-rank 2
+    --moe-ultraep-autotune
 )
 
 MODEL_PARALLEL_ARGS=(

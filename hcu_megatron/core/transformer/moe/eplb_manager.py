@@ -75,7 +75,8 @@ class EPLBManager:
         # HCU BLOCKER: ultra_ep.Manager instantiates the compiled C++ extension
         # (ultra_ep._C). Only reachable when HAVE_EPLB=True.
         #
-        self.runtime = ultra_ep.Manager(
+        autotune_enabled = bool(getattr(config, "moe_ultraep_autotune", False))
+        manager_kwargs = dict(
             group=self.group,
             num_layers=config.num_layers,
             num_local_master_experts=self.num_local_master_experts,
@@ -86,6 +87,50 @@ class EPLBManager:
             explicitly_destroy=False,
             max_microbatches=self.max_microbatches,
         )
+        if autotune_enabled:
+            required_runtime_methods = (
+                "autotune_iteration_end",
+                "autotune_needs_iteration_time",
+                "wait_grad_reduce",
+                "wait_weight_sync",
+            )
+            missing_apis = []
+            if not hasattr(ultra_ep, "AutotuneConfig"):
+                missing_apis.append("AutotuneConfig")
+            missing_apis.extend(
+                f"Manager.{name}"
+                for name in required_runtime_methods
+                if not hasattr(ultra_ep.Manager, name)
+            )
+            if missing_apis:
+                raise RuntimeError(
+                    "--moe-ultraep-autotune requires an autotune-enabled "
+                    "UltraEP runtime; missing APIs: " + ", ".join(missing_apis)
+                )
+            manager_kwargs["autotune"] = ultra_ep.AutotuneConfig(
+                enabled=True,
+                start_iteration=getattr(
+                    config, "moe_ultraep_autotune_start_iteration", 3
+                ),
+                grad_reduce_max_sms=getattr(
+                    config, "moe_ultraep_autotune_grad_reduce_max_sms", None
+                ),
+            )
+
+        self.runtime = ultra_ep.Manager(**manager_kwargs)
+        # This counter is intentionally local to this Manager lifetime rather
+        # than Megatron's checkpointed global iteration. A resumed job must
+        # still receive its two conservative warm-up iterations.
+        self._autotune_iteration = 0
+        if self.rank == 0 and getattr(self.runtime, "autotune_enabled", False):
+            print(
+                "UltraEP Megatron autotune enabled: "
+                f"start_iteration={self.runtime.autotune_start_iteration}, "
+                "sequence=weight-sync -> grad-reduce, "
+                f"grad_reduce_max_sms="
+                f"{getattr(config, 'moe_ultraep_autotune_grad_reduce_max_sms', None)}",
+                flush=True,
+            )
 
         # Mirror replica GPU buffers from the runtime.
         self.local_replica_weight_buffer: torch.Tensor = (
@@ -132,6 +177,36 @@ class EPLBManager:
         """
         return self.runtime.allocate_microbatch_slot(real_layer_id)
 
+    @property
+    def autotune_collecting(self) -> bool:
+        return bool(getattr(self.runtime, "autotune_collecting", False))
+
+    @property
+    def next_autotune_iteration(self) -> int:
+        return self._autotune_iteration + 1
+
+    @property
+    def autotune_needs_iteration_time(self) -> bool:
+        return self.runtime.autotune_needs_iteration_time(
+            self.next_autotune_iteration
+        )
+
+    def autotune_iteration_end(self, iteration_time_ms=None) -> None:
+        """Advance the one-shot tuner exactly once per complete train step."""
+        if not self.autotune_collecting:
+            return
+        self._autotune_iteration += 1
+        if self.rank == 0 and self._autotune_iteration == 1:
+            print(
+                "UltraEP Megatron autotune train-step callback active; "
+                f"calibration starts at local iteration {self.runtime.autotune_start_iteration}.",
+                flush=True,
+            )
+        self.runtime.autotune_iteration_end(
+            self._autotune_iteration,
+            iteration_time_ms=iteration_time_ms,
+        )
+
 
 _eplb_manager_registry: Dict[int, EPLBManager] = {}
 
@@ -150,3 +225,14 @@ def get_or_create_eplb_manager(
 def clear_eplb_manager_registry():
     global _eplb_manager_registry
     _eplb_manager_registry.clear()
+
+
+def get_eplb_managers() -> Tuple[EPLBManager, ...]:
+    """Return Managers in deterministic construction order on this rank."""
+    return tuple(_eplb_manager_registry.values())
+
+
+def get_collecting_eplb_managers() -> Tuple[EPLBManager, ...]:
+    return tuple(
+        manager for manager in get_eplb_managers() if manager.autotune_collecting
+    )
