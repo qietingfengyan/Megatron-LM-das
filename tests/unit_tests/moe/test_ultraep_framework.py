@@ -23,7 +23,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from hcu_megatron.core.distributed.distributed_data_parallel import (
-    DistributedDataParallel,
+    DistributedDataParallel as HcuDistributedDataParallel,
 )
 from hcu_megatron.core.distributed.param_and_grad_buffer import (
     _compute_full_param_layout_ultraep_wrapper,
@@ -374,7 +374,9 @@ class TestDistributedParameterHandling:
             ddp_config=SimpleNamespace(overlap_grad_reduce=True),
             force_all_reduce=False,
         )
-        hook = types.MethodType(DistributedDataParallel._make_backward_post_hook, ddp)(master)
+        hook = types.MethodType(
+            HcuDistributedDataParallel._make_backward_post_hook, ddp
+        )(master)
         args = SimpleNamespace(
             gradient_accumulation_fusion=False,
             delay_wgrad_compute=False,
@@ -402,7 +404,9 @@ class TestDistributedParameterHandling:
             ddp_config=SimpleNamespace(overlap_grad_reduce=True),
             force_all_reduce=True,
         )
-        hook = types.MethodType(DistributedDataParallel._make_backward_post_hook, ddp)(param)
+        hook = types.MethodType(
+            HcuDistributedDataParallel._make_backward_post_hook, ddp
+        )(param)
         args = SimpleNamespace(
             gradient_accumulation_fusion=False,
             delay_wgrad_compute=False,
@@ -887,7 +891,23 @@ def _assert_filled(tensor, expected, label):
 
 
 @pytest.fixture(scope="module")
-def ultraep_runtime():
+def _ultraep_environment():
+    """Apply the single-node IPC environment without leaking it to other tests."""
+    runtime_environment = {
+        "HSA_USE_SVM": "0",
+        "MAX_NUM_NVL_PEERS": "8",
+        "ROCSHMEM_BACKEND": "ipc",
+        # A 64 MiB symmetric heap is ample for this test's few KiB of state
+        # and avoids eight model-scale 2 GiB allocations in CI.
+        "ROCSHMEM_HEAP_SIZE": str(64 * 1024**2),
+    }
+    with patch.dict(os.environ, runtime_environment, clear=False):
+        os.environ.pop("ROCSHMEM_GDA_PROVIDER", None)
+        yield
+
+
+@pytest.fixture(scope="module")
+def ultraep_runtime(_ultraep_environment):
     required = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     if not all(name in os.environ for name in required):
         pytest.skip("run with torchrun --nproc-per-node=8")
@@ -898,17 +918,6 @@ def ultraep_runtime():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
         pytest.skip(f"UltraEP integration requires 8 HCUs, got {torch.cuda.device_count()}")
     ultra_ep = pytest.importorskip("ultra_ep")
-
-    # Keep the test launch self-contained and aligned with the supported
-    # single-node IPC configuration.
-    os.environ["HSA_USE_SVM"] = "0"
-    os.environ["MAX_NUM_NVL_PEERS"] = "8"
-    os.environ["ROCSHMEM_BACKEND"] = "ipc"
-    os.environ.pop("ROCSHMEM_GDA_PROVIDER", None)
-    # This test allocates only a few KiB of expert state. A 64 MiB symmetric
-    # heap leaves ample headroom while avoiding eight concurrent 2 GiB pinned
-    # allocations, which are appropriate for model-scale runs rather than CI.
-    os.environ["ROCSHMEM_HEAP_SIZE"] = str(64 * 1024**2)
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
