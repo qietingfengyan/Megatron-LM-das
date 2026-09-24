@@ -4,7 +4,7 @@
 
 Pure framework logic uses a fake Manager so it stays deterministic. The EP8
 tests at the bottom use the installed extension and real RCCL/rocSHMEM. Run all
-tests on one eight-DCU node with::
+tests on one eight-HCU node with::
 
     python -m torch.distributed.run --nproc-per-node=8 -m pytest -s -vv \
         tests/unit_tests/moe/test_ultraep_framework.py
@@ -896,7 +896,7 @@ def ultraep_runtime():
     if world_size != 8:
         pytest.skip(f"UltraEP integration requires exactly 8 ranks, got {world_size}")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
-        pytest.skip(f"UltraEP integration requires 8 DCUs, got {torch.cuda.device_count()}")
+        pytest.skip(f"UltraEP integration requires 8 HCUs, got {torch.cuda.device_count()}")
     ultra_ep = pytest.importorskip("ultra_ep")
 
     # Keep the test launch self-contained and aligned with the supported

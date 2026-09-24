@@ -41,7 +41,7 @@ RANK=$OMPI_COMM_WORLD_RANK
 LOCAL_RANK=$OMPI_COMM_WORLD_LOCAL_RANK
 WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
 export MEGATRON_LAUNCH_BACKEND=${launch_backend:-"mpirun"}
-MASTER_ADDR=${MASTER_ADDR:-loadlhost}
+MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-0}}}
@@ -101,7 +101,7 @@ TORCH_DISTRIBUTED_ARGS=(
 
 GPT_MODEL_ARGS=(
     --seq-length ${SEQ_LEN}
-    --num-layers 12
+    --num-layers 48
     --hidden-size 2048
     --ffn-hidden-size 6144 
     --moe-ffn-hidden-size 768
