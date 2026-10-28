@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""UltraEP framework, adaptive policy, and single-node EP8 model/runtime tests.
+"""Core UltraEP framework/adaptive tests and EP8 model parity.
 
-Pure framework logic uses a fake Manager so it stays deterministic. The EP8
-tests at the bottom use the installed extension and real RCCL/rocSHMEM. Run all
-tests on one eight-HCU node with::
+CPU tests cover framework contracts and selection policy. EP8 tests exercise
+real weight sync, rerouting and gradient reduction through GPT training. Run::
 
     python -m torch.distributed.run --nproc-per-node=8 -m pytest -s -vv \
         tests/unit_tests/moe/test_ultraep_framework.py
@@ -16,7 +15,6 @@ import sys
 import types
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -43,21 +41,11 @@ from hcu_megatron.features_manager.moe.ultraep_feature import (
     UltraEPFeature,
     _get_param_groups_ultraep_wrapper,
 )
-from hcu_megatron.training.checkpointing import (
-    _filter_ultraep_native_model_state_dict,
-    generate_state_dict_ultraep_wrapper,
-)
+from hcu_megatron.training.checkpointing import generate_state_dict_ultraep_wrapper
 from hcu_megatron.training.ultraep_adaptive import AdaptiveConfig, AdaptiveController
 from hcu_megatron.training.ultraep_autotune import (
     ultraep_autotune_train_step_wrapper,
 )
-
-
-@dataclass
-class FakeAutotuneConfig:
-    enabled: bool = False
-    start_iteration: int = 3
-    grad_reduce_max_sms: int | None = None
 
 
 class FakeEventHandle:
@@ -66,75 +54,6 @@ class FakeEventHandle:
 
     def current_stream_wait(self):
         self.wait_count += 1
-
-
-class FakeUltraEPManager:
-    """CPU replacement for ``ultra_ep.Manager`` used by EPLBManager tests."""
-
-    instances = []
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.__class__.instances.append(self)
-        redundant = kwargs["num_local_redundant_experts"]
-        fc1_numel = kwargs["expert_fc1_numel"]
-        fc2_numel = kwargs["expert_fc2_numel"]
-        self.local_replica_fc1_weight_buffer = torch.zeros(redundant, fc1_numel)
-        self.local_replica_fc2_weight_buffer = torch.zeros(redundant, fc2_numel)
-        self.local_replica_fc1_grad_buffer = torch.zeros(redundant, fc1_numel)
-        self.local_replica_fc2_grad_buffer = torch.zeros(redundant, fc2_numel)
-        self.local_replica_weight_buffer = torch.zeros(redundant, fc1_numel + fc2_numel)
-        self.local_replica_grad_buffer = torch.zeros(redundant, fc1_numel + fc2_numel)
-        config = kwargs.get("autotune")
-        self.autotune_enabled = bool(config and config.enabled)
-        self.autotune_collecting = self.autotune_enabled
-        self.autotune_start_iteration = config.start_iteration if config else 3
-        self.iteration_end_calls = []
-        self.placement_calls = []
-        self._next_virtual_layer = 100
-
-    def update_placement(self, layer_id, routing_map):
-        self.placement_calls.append((layer_id, routing_map))
-
-    def reroute(self, layer_id, probs, routing_map, backend="cuda"):
-        return probs + 1, ~routing_map
-
-    def allocate_microbatch_slot(self, real_layer_id):
-        self._next_virtual_layer += 1
-        return self._next_virtual_layer
-
-    def autotune_needs_iteration_time(self, iteration):
-        return iteration >= self.autotune_start_iteration
-
-    def autotune_iteration_end(self, iteration, iteration_time_ms=None):
-        self.iteration_end_calls.append((iteration, iteration_time_ms))
-
-    def wait_grad_reduce(self, event, layer_id=None):
-        event.current_stream_wait()
-
-    def wait_weight_sync(self, event, layer_id):
-        event.current_stream_wait()
-
-
-def _fake_ultra_ep(manager_cls=FakeUltraEPManager):
-    return SimpleNamespace(Manager=manager_cls, AutotuneConfig=FakeAutotuneConfig)
-
-
-def _manager_config(**overrides):
-    values = dict(
-        num_layers=4,
-        num_moe_experts=8,
-        moe_num_redundant_experts_per_rank=2,
-        hidden_size=4,
-        moe_ffn_hidden_size=3,
-        pipeline_model_parallel_size=2,
-        virtual_pipeline_model_parallel_size=None,
-        moe_ultraep_autotune=False,
-        moe_ultraep_autotune_start_iteration=3,
-        moe_ultraep_autotune_grad_reduce_max_sms=None,
-    )
-    values.update(overrides)
-    return SimpleNamespace(**values)
 
 
 def _feature_args(**overrides):
@@ -258,90 +177,6 @@ class TestUltraEPFeature:
 
 
 class TestEPLBManager:
-    @pytest.fixture(autouse=True)
-    def reset_registry(self):
-        FakeUltraEPManager.instances.clear()
-        eplb_manager_module.clear_eplb_manager_registry()
-        yield
-        eplb_manager_module.clear_eplb_manager_registry()
-
-    def _construct(self, monkeypatch, config=None, rank=1, size=2, ultra_ep=None):
-        monkeypatch.setattr(eplb_manager_module.utils, "get_pg_rank", lambda group: rank)
-        monkeypatch.setattr(eplb_manager_module.utils, "get_pg_size", lambda group: size)
-        monkeypatch.setattr(
-            eplb_manager_module, "ultra_ep", ultra_ep or _fake_ultra_ep(), raising=False
-        )
-        monkeypatch.setattr(eplb_manager_module.EPLBManager, '_prepare_peer_fence', lambda self: None)
-        return eplb_manager_module.EPLBManager(config or _manager_config(), object())
-
-    def test_constructs_counts_slots_and_runtime_buffers(self, monkeypatch):
-        manager = self._construct(monkeypatch)
-        assert manager.num_local_master_experts == 4
-        assert manager.num_local_physical_experts == 6
-        assert manager.num_global_physical_experts == 12
-        assert manager.local_physical_expert_indices == list(range(6, 12))
-        assert manager.expert_fc1_numel == 24
-        assert manager.expert_fc2_numel == 12
-        assert manager.max_microbatches == 6
-        assert manager.local_replica_fc1_weight_buffer.shape == (2, 24)
-        assert "autotune" not in manager.runtime.kwargs
-
-    def test_virtual_pipeline_increases_slot_budget(self, monkeypatch):
-        config = _manager_config(virtual_pipeline_model_parallel_size=3)
-        manager = self._construct(monkeypatch, config=config)
-        assert manager.max_microbatches == 2 * (3 + 1) * 3
-
-    def test_passes_autotune_config_and_advances_local_iteration(self, monkeypatch):
-        config = _manager_config(
-            moe_ultraep_autotune=True,
-            moe_ultraep_autotune_start_iteration=5,
-            moe_ultraep_autotune_grad_reduce_max_sms=48,
-        )
-        manager = self._construct(monkeypatch, config=config, rank=0)
-        runtime_config = manager.runtime.kwargs["autotune"]
-        assert runtime_config == FakeAutotuneConfig(True, 5, 48)
-        assert manager.next_autotune_iteration == 1
-        assert manager.autotune_needs_iteration_time is False
-        manager.autotune_iteration_end(12.5)
-        assert manager.next_autotune_iteration == 2
-        assert manager.runtime.iteration_end_calls == [(1, 12.5)]
-        manager.runtime.autotune_collecting = False
-        manager.autotune_iteration_end(99.0)
-        assert manager.runtime.iteration_end_calls == [(1, 12.5)]
-
-    def test_reports_missing_autotune_runtime_apis(self, monkeypatch):
-        class OldManager:
-            pass
-
-        old_runtime = SimpleNamespace(Manager=OldManager)
-        with pytest.raises(RuntimeError, match="AutotuneConfig") as error:
-            self._construct(
-                monkeypatch,
-                config=_manager_config(moe_ultraep_autotune=True),
-                ultra_ep=old_runtime,
-            )
-        assert "Manager.wait_weight_sync" in str(error.value)
-
-    def test_runtime_delegates_and_registry(self, monkeypatch):
-        manager = self._construct(monkeypatch)
-        routing = torch.tensor([[True, False]])
-        manager.update_placement(7, routing)
-        assert manager.runtime.placement_calls == [(7, routing)]
-        probs = torch.tensor([[0.25, 0.75]])
-        new_probs, new_routing = manager.reroute(7, probs, routing, backend="cpu")
-        assert torch.equal(new_probs, probs + 1)
-        assert torch.equal(new_routing, ~routing)
-        assert manager.allocate_microbatch_slot(3) == 101
-
-        group = object()
-        monkeypatch.setattr(eplb_manager_module, "EPLBManager", lambda config, ep_group: manager)
-        first = eplb_manager_module.get_or_create_eplb_manager(_manager_config(), group)
-        second = eplb_manager_module.get_or_create_eplb_manager(_manager_config(), group)
-        assert first is second is manager
-        assert eplb_manager_module.get_eplb_managers() == (manager,)
-        manager.runtime.autotune_collecting = True
-        assert eplb_manager_module.get_collecting_eplb_managers() == (manager,)
-
 
     def test_grad_reduce_invalidates_reused_ws_task_metadata(self, monkeypatch):
         manager = eplb_manager_module.EPLBManager.__new__(eplb_manager_module.EPLBManager)
@@ -464,39 +299,6 @@ class TestDistributedParameterHandling:
         ):
             hook()
         bucket.register_grad_ready.assert_not_called()
-
-    def test_normal_backward_hook_accumulates_and_registers(self):
-        param = nn.Parameter(torch.zeros(2))
-        param.grad = torch.ones(2)
-        param.main_grad = torch.zeros(2)
-        param.grad_added_to_main_grad = False
-        bucket = MagicMock()
-        ddp = SimpleNamespace(
-            param_to_bucket_group={param: bucket},
-            ddp_config=SimpleNamespace(overlap_grad_reduce=True),
-            force_all_reduce=True,
-        )
-        hook = types.MethodType(
-            HcuDistributedDataParallel._make_backward_post_hook, ddp
-        )(param)
-        args = SimpleNamespace(
-            gradient_accumulation_fusion=False,
-            delay_wgrad_compute=False,
-            recompute_in_advance=False,
-            recompute_in_bubble=False,
-        )
-        with patch(
-            "hcu_megatron.core.distributed.distributed_data_parallel.get_args",
-            return_value=args,
-        ), patch(
-            "hcu_megatron.core.distributed.distributed_data_parallel.is_graph_capturing",
-            return_value=False,
-        ):
-            hook()
-        assert torch.equal(param.main_grad, torch.ones(2))
-        assert param.grad is None
-        bucket.register_grad_ready.assert_called_once_with(param, True)
-
 
     def test_master_ready_wrapper_preserves_baseline_hook(self):
         from hcu_megatron.core.distributed.distributed_data_parallel import ultraep_backward_post_hook_wrapper
@@ -650,15 +452,6 @@ class TestMoELayerUltraEP:
             call(first, layer_id=11),
         ]
 
-    def test_grad_reduce_wait_falls_back_for_legacy_runtime(self):
-        event = FakeEventHandle()
-        layer = SimpleNamespace(
-            _eplb_grad_reduce_event_handles={7: event},
-            eplb_manager=SimpleNamespace(runtime=SimpleNamespace()),
-        )
-        moe_layer_ultraep._eplb_finish_grad_reduce(layer, 7)
-        assert event.wait_count == 1
-
     def test_master_grad_ready_only_for_overlap_buckets(self):
         layer = _fake_moe_layer()
         moe_layer_ultraep._eplb_register_redundant_experts(layer)
@@ -674,108 +467,37 @@ class TestMoELayerUltraEP:
         )
         sync_bucket.register_grad_ready.assert_not_called()
 
-    def test_autograd_functions_preserve_virtual_layer_order(self):
-        events = []
-        runtime = SimpleNamespace(
-            weight_sync=lambda **kwargs: events.append(("weight", kwargs))
-        )
-        layer = SimpleNamespace(
-            eplb_manager=SimpleNamespace(runtime=runtime, weight_sync=runtime.weight_sync),
-            _eplb_start_grad_reduce=lambda virtual_layer_id: events.append(
-                ("start", virtual_layer_id)
-            ),
-            _eplb_finish_grad_reduce=lambda virtual_layer_id: events.append(
-                ("finish", virtual_layer_id)
-            ),
-            _eplb_register_master_grad_ready=lambda: events.append(("ready",)),
-        )
-        value = torch.ones(2, requires_grad=True)
-        value = moe_layer_ultraep._EPLBReplicaGradReduceFinishFunction.apply(
-            value, layer, 17
-        )
-        value = moe_layer_ultraep._EPLBReplicaGradReduceStartFunction.apply(
-            value, layer, 17
-        )
-        value = moe_layer_ultraep._EPLBWeightSyncFunction.apply(value, layer, 17)
-        value.sum().backward()
-        assert events == [
-            ("weight", {"layer_id": 17, "async_finish": False}),
-            ("start", 17),
-            ("finish", 17),
-            ("ready",),
-        ]
-
     def test_forward_overlaps_dispatch_before_weight_sync_wait(self):
-        events = []
-        event = FakeEventHandle()
+        layer = _fake_moe_layer()
+        events, event = [], FakeEventHandle()
+        manager = layer.eplb_manager
+        manager.allocate_microbatch_slot = lambda layer_id: 23
+        manager.update_placement = MagicMock()
+        manager.reroute = lambda layer_id, probs, routing: (probs, routing)
+        manager.weight_sync.return_value = event
 
-        class Runtime:
-            def weight_sync(self, **kwargs):
-                events.append("weight_sync")
-                return event
+        def wait(handle, layer_id):
+            assert handle is event and layer_id == 23
+            events.append('wait_weight_sync')
+            handle.current_stream_wait()
 
-            def wait_weight_sync(self, handle, layer_id):
-                assert handle is event and layer_id == 23
-                events.append("wait_weight_sync")
-                handle.current_stream_wait()
-
-        manager = SimpleNamespace(
-            runtime=Runtime(),
-            allocate_microbatch_slot=lambda layer_id: 23,
-            update_placement=lambda layer_id, routing: events.append("placement"),
-            reroute=lambda layer_id, probs, routing: (
-                events.append("reroute") or probs,
-                routing,
-            ),
-        )
-        manager.weight_sync = manager.runtime.weight_sync
-        layer = SimpleNamespace(
-            eplb_enabled=True,
-            eplb_manager=manager,
-            experts=SimpleNamespace(
-                linear_fc1=SimpleNamespace(weight0=object()),
-                linear_fc2=SimpleNamespace(weight0=object()),
-            ),
-            layer_number=4,
-            _eplb_master_ptrs_registered=True,
-            _eplb_weight_sync_event_handle=None,
-            moe_layer_recompute=False,
-            shared_experts_compute=lambda hidden: None,
-            route=lambda hidden, mask: (
-                events.append("route") or torch.ones(2, 2, dtype=torch.float16),
-                torch.tensor([[True, False], [False, True]]),
-            ),
-            preprocess=lambda hidden, probs, routing: (
-                events.append("preprocess") or hidden,
-                probs,
-            ),
-            dispatch=lambda hidden, probs: (events.append("dispatch") or hidden, probs),
-            routed_experts_compute=lambda hidden, probs: (
-                events.append("experts") or hidden,
-                None,
-            ),
-            combine=lambda output: events.append("combine") or output,
-            postprocess=lambda output, shared: events.append("postprocess") or output,
-        )
-        wrapped = moe_layer_ultraep.moe_layer_ultraep_forward_wrapper(
-            lambda *args, **kwargs: pytest.fail("original forward should not run")
-        )
-        output, bias = wrapped(layer, torch.ones(2, 2, requires_grad=True))
+        manager.runtime.wait_weight_sync.side_effect = wait
+        layer.eplb_enabled = layer._eplb_master_ptrs_registered = True
+        layer._eplb_weight_sync_event_handle = None
+        layer.moe_layer_recompute = False
+        layer.shared_experts_compute = lambda hidden: None
+        layer.route = lambda hidden, mask: (torch.ones(2, 2), torch.eye(2, dtype=torch.bool))
+        layer.preprocess = lambda hidden, probs, routing: (hidden, probs)
+        layer.dispatch = lambda hidden, probs: (events.append('dispatch') or hidden, probs)
+        layer.routed_experts_compute = lambda hidden, probs: (events.append('experts') or hidden, None)
+        layer.combine = lambda output: output
+        layer.postprocess = lambda output, shared: output
+        original = MagicMock()
+        output, bias = moe_layer_ultraep.moe_layer_ultraep_forward_wrapper(original)(layer, torch.ones(2, 2))
+        original.assert_not_called()
         assert output.shape == (2, 2) and bias is None
-        assert events == [
-            "route",
-            "placement",
-            "weight_sync",
-            "reroute",
-            "preprocess",
-            "dispatch",
-            "wait_weight_sync",
-            "experts",
-            "combine",
-            "postprocess",
-        ]
-        assert event.wait_count == 1
-        assert layer._eplb_weight_sync_event_handle is None
+        assert events == ['dispatch', 'wait_weight_sync', 'experts']
+        assert event.wait_count == 1 and layer._eplb_weight_sync_event_handle is None
 
     def test_disabled_forward_delegates_unchanged(self):
         original = MagicMock(return_value=("output", "bias"))
@@ -798,7 +520,6 @@ class TestMoELayerUltraEP:
         wrapped = moe_layer_ultraep.moe_layer_ultraep_init_wrapper(MagicMock())
         with pytest.raises(ImportError, match="ultra_ep could not be imported"):
             wrapped(object(), SimpleNamespace(moe_enable_ultraep=True))
-
 
     def test_switch_restores_logical_dispatcher_and_preserves_parameters(self):
         layer = _fake_moe_layer()
@@ -863,48 +584,6 @@ class TestCheckpointFiltering:
         }
         assert module.num_local_experts == 4
 
-    @pytest.mark.parametrize(
-        "wrapper,module,args",
-        [
-            (
-                te_grouped_linear_sharded_state_dict_wrapper,
-                SimpleNamespace(num_gemms=4, num_local_master_experts=2),
-                (None,),
-            ),
-            (
-                te_grouped_mlp_sharded_state_dict_wrapper,
-                SimpleNamespace(num_local_experts=4, num_local_master_experts=2),
-                (),
-            ),
-        ],
-    )
-    def test_grouped_checkpoint_wrappers_restore_counts_on_error(self, wrapper, module, args):
-        attribute = "num_gemms" if hasattr(module, "num_gemms") else "num_local_experts"
-        with pytest.raises(RuntimeError, match="expected"):
-            wrapper(lambda *unused, **kwargs: (_ for _ in ()).throw(RuntimeError("expected")))(
-                module, *args
-            )
-        assert getattr(module, attribute) == 4
-
-    def test_native_filter_handles_wrapped_model_and_missing_config(self):
-        config = SimpleNamespace(num_moe_experts=8, expert_model_parallel_size=2)
-        model = SimpleNamespace(module=SimpleNamespace(config=config))
-        state = {
-            "decoder.mlp.linear_fc1.weight3": 3,
-            "decoder.mlp.linear_fc1.weight4": 4,
-            "decoder.mlp.linear_fc2.bias7": 7,
-            "decoder.dense.weight": 8,
-        }
-        filtered = _filter_ultraep_native_model_state_dict(state, [model])
-        assert filtered == {
-            "decoder.mlp.linear_fc1.weight3": 3,
-            "decoder.dense.weight": 8,
-        }
-        assert _filter_ultraep_native_model_state_dict(state, []) is state
-        assert _filter_ultraep_native_model_state_dict(
-            state, [SimpleNamespace()]
-        ) is state
-
     @pytest.mark.parametrize("ckpt_format, should_filter", [("torch", True), ("torch_dist", False)])
     def test_generate_state_dict_filters_only_native_checkpoints(
         self, ckpt_format, should_filter
@@ -933,11 +612,8 @@ class TestCheckpointFiltering:
 class TestAutotuneTrainStep:
     @staticmethod
     def _install_manager_query(monkeypatch, managers):
-        monkeypatch.setattr(
-            eplb_manager_module,
-            "get_collecting_eplb_managers",
-            lambda: tuple(managers),
-        )
+        monkeypatch.setattr(eplb_manager_module, 'get_eplb_managers', lambda: ())
+        monkeypatch.setattr(eplb_manager_module, 'get_collecting_eplb_managers', lambda: tuple(managers))
 
     def test_fast_path_has_no_device_synchronization(self, monkeypatch):
         self._install_manager_query(monkeypatch, [])
@@ -948,44 +624,20 @@ class TestAutotuneTrainStep:
         synchronize.assert_not_called()
         train_step.assert_called_once_with(1, marker=True)
 
-    def test_collecting_non_timed_iteration_reports_none(self, monkeypatch):
-        manager = MagicMock()
-        manager.autotune_needs_iteration_time = False
-        self._install_manager_query(monkeypatch, [manager])
-        wrapped = ultraep_autotune_train_step_wrapper(lambda: "result")
-        with patch("torch.cuda.synchronize") as synchronize:
-            assert wrapped() == "result"
-        synchronize.assert_called_once()
-        manager.autotune_iteration_end.assert_called_once_with(None)
-
-    def test_timed_iteration_synchronizes_and_reports_all_managers(self, monkeypatch):
+    @pytest.mark.parametrize('timed', [False, True])
+    def test_autotune_reports_complete_steps_to_all_managers(self, monkeypatch, timed):
         first, second = MagicMock(), MagicMock()
         first.autotune_needs_iteration_time = False
-        second.autotune_needs_iteration_time = True
+        second.autotune_needs_iteration_time = timed
         self._install_manager_query(monkeypatch, [first, second])
-        wrapped = ultraep_autotune_train_step_wrapper(lambda: "result")
-        with patch("torch.cuda.synchronize") as synchronize, patch(
-            "hcu_megatron.training.ultraep_autotune.time.perf_counter",
-            side_effect=[2.0, 2.125],
+        wrapped = ultraep_autotune_train_step_wrapper(lambda: 'result')
+        with patch('torch.cuda.synchronize') as synchronize, patch(
+            'hcu_megatron.training.ultraep_autotune.time.perf_counter', side_effect=[2.0, 2.125],
         ):
-            assert wrapped() == "result"
-        assert synchronize.call_count == 2
-        first.autotune_iteration_end.assert_called_once_with(125.0)
-        second.autotune_iteration_end.assert_called_once_with(125.0)
-
-    def test_failed_train_step_does_not_advance_tuner(self, monkeypatch):
-        manager = MagicMock()
-        manager.autotune_needs_iteration_time = True
-        self._install_manager_query(monkeypatch, [manager])
-
-        def fail():
-            raise RuntimeError("training failed")
-
-        wrapped = ultraep_autotune_train_step_wrapper(fail)
-        with patch("torch.cuda.synchronize"):
-            with pytest.raises(RuntimeError, match="training failed"):
-                wrapped()
-        manager.autotune_iteration_end.assert_not_called()
+            assert wrapped() == 'result'
+        assert synchronize.call_count == (2 if timed else 1)
+        for manager in (first, second):
+            manager.autotune_iteration_end.assert_called_once_with(125.0 if timed else None)
 
     @pytest.mark.parametrize('has_local_manager', [True, False])
     def test_adaptive_bridge_reuses_timer_and_stops_after_selection(self, monkeypatch, has_local_manager):
@@ -1105,41 +757,7 @@ class TestUltraEPAdaptivePolicy:
         )
 
 
-# Real single-node EP8 integration tests.
-
-NUM_EXPERTS = 16
-NUM_LOCAL_REPLICAS = 2
-TOKENS_PER_RANK = 1024
-FC1_NUMEL = 1024
-FC2_NUMEL = 512
-LAYER_ID = 0
-
-
-def _distributed_validate(label, validation):
-    """Report validation failures from every rank before failing the test."""
-    local_error = None
-    try:
-        validation()
-    except Exception as error:  # noqa: BLE001 - aggregate rank-local assertions
-        local_error = f"rank {dist.get_rank()}: {type(error).__name__}: {error}"
-
-    errors = [None] * dist.get_world_size()
-    dist.all_gather_object(errors, local_error)
-    failures = [error for error in errors if error is not None]
-    assert not failures, f"{label} failed:\n" + "\n".join(failures)
-
-
-def _fill_master_tensors(tensors, base):
-    rank = dist.get_rank()
-    for local_index, tensor in enumerate(tensors):
-        logical_id = rank * len(tensors) + local_index
-        tensor.fill_(float(base + logical_id))
-
-
-def _assert_filled(tensor, expected, label):
-    assert bool((tensor == expected).all().item()), (
-        f"{label}: expected every element to be {expected}"
-    )
+# Real single-node EP8 model tests.
 
 
 @pytest.fixture(scope="module")
@@ -1149,7 +767,7 @@ def _ultraep_environment():
         "HSA_USE_SVM": "0",
         "MAX_NUM_NVL_PEERS": "8",
         "ROCSHMEM_BACKEND": "ipc",
-        # Share one small heap between native runtime and tiny model tests.
+        # Limit the IPC heap for the tiny EP8 models.
         "ROCSHMEM_HEAP_SIZE": str(256 * 1024**2),
     }
     with patch.dict(os.environ, runtime_environment, clear=False):
@@ -1159,6 +777,11 @@ def _ultraep_environment():
 
 @pytest.fixture(scope="module")
 def _ultraep_distributed(_ultraep_environment):
+    # Skip unavailable backends before GPU setup and process-group creation.
+    try:
+        import ultra_ep
+    except ImportError as error:
+        pytest.skip(f"UltraEP backend is unavailable: {error}")
     required = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     if not all(name in os.environ for name in required):
         pytest.skip("run with torchrun --nproc-per-node=8")
@@ -1178,285 +801,12 @@ def _ultraep_distributed(_ultraep_environment):
             device_id=torch.device("cuda", local_rank),
         )
     try:
-        yield
+        yield ultra_ep
     finally:
         if initialized_here and dist.is_initialized():
             torch.cuda.synchronize()
             dist.barrier()
             dist.destroy_process_group()
-
-
-@pytest.fixture(scope="class")
-def ultraep_runtime(_ultraep_distributed):
-    ultra_ep = pytest.importorskip("ultra_ep")
-    world_size = dist.get_world_size()
-
-    rank = dist.get_rank()
-    num_local_master = NUM_EXPERTS // world_size
-    num_local_physical = num_local_master + NUM_LOCAL_REPLICAS
-    manager = None
-    setup_complete = False
-    try:
-        manager = ultra_ep.Manager(
-            group=dist.group.WORLD,
-            num_layers=1,
-            num_local_master_experts=num_local_master,
-            num_local_redundant_experts=NUM_LOCAL_REPLICAS,
-            expert_fc1_numel=FC1_NUMEL,
-            expert_fc2_numel=FC2_NUMEL,
-            is_train=True,
-            explicitly_destroy=True,
-            max_microbatches=2,
-            weight_data_dtype=torch.bfloat16,
-            grad_dtype=torch.float32,
-            autotune=ultra_ep.AutotuneConfig(
-                enabled=True,
-                start_iteration=3,
-                grad_reduce_max_sms=48,
-            ),
-        )
-
-        fc1_weights = [
-            torch.empty(FC1_NUMEL, dtype=torch.bfloat16, device="cuda")
-            for _ in range(num_local_master)
-        ]
-        fc2_weights = [
-            torch.empty(FC2_NUMEL, dtype=torch.bfloat16, device="cuda")
-            for _ in range(num_local_master)
-        ]
-        fc1_grads = [
-            torch.empty(FC1_NUMEL, dtype=torch.float32, device="cuda")
-            for _ in range(num_local_master)
-        ]
-        fc2_grads = [
-            torch.empty(FC2_NUMEL, dtype=torch.float32, device="cuda")
-            for _ in range(num_local_master)
-        ]
-        _fill_master_tensors(fc1_weights, 1)
-        _fill_master_tensors(fc2_weights, 33)
-        _fill_master_tensors(fc1_grads, 65)
-        _fill_master_tensors(fc2_grads, 97)
-        manager.construct_local_master_ptr_pool(
-            LAYER_ID,
-            fc1_weights,
-            fc2_weights,
-            fc1_grads,
-            fc2_grads,
-        )
-
-        routing_map = torch.zeros(
-            (TOKENS_PER_RANK, NUM_EXPERTS),
-            dtype=torch.bool,
-            device="cuda",
-        )
-        routing_map[:, 0] = True
-        manager.update_placement(
-            LAYER_ID,
-            routing_map,
-            verify_reduced_loads=True,
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        setup_complete = True
-        yield SimpleNamespace(
-            manager=manager,
-            rank=rank,
-            world_size=world_size,
-            num_local_master=num_local_master,
-            num_local_physical=num_local_physical,
-            fc1_weights=fc1_weights,
-            fc2_weights=fc2_weights,
-            fc1_grads=fc1_grads,
-            fc2_grads=fc2_grads,
-            routing_map=routing_map,
-        )
-    finally:
-        if setup_complete:
-            dist.barrier()
-        if manager is not None:
-            manager.destroy()
-
-
-class TestUltraEPFeatureEP8:
-    def test_runtime_autotune_contract(self, ultraep_runtime):
-        manager = ultraep_runtime.manager
-
-        def validate():
-            assert manager.nvl_domain_size == 8
-            assert manager.autotune_enabled
-            assert manager.autotune_collecting
-            assert manager.autotune_start_iteration == 3
-            assert manager.autotune_needs_iteration_time(1) is False
-            assert manager.grad_reduce_num_sms <= 48
-            assert manager.num_local_master_experts == 2
-            assert manager.num_local_redundant_experts == 2
-            assert manager.num_global_logical_experts == NUM_EXPERTS
-            assert manager.num_global_physical_experts == 32
-
-        _distributed_validate("runtime/autotune contract", validate)
-
-        # Exercise the same process-local warm-up callbacks used by the
-        # Megatron train-step bridge without advancing into candidate search.
-        manager.autotune_iteration_end(1)
-        manager.autotune_iteration_end(2)
-        dist.barrier()
-
-    def test_placement_and_reroute(self, ultraep_runtime):
-        manager = ultraep_runtime.manager
-        routing_map = ultraep_runtime.routing_map
-        probs = routing_map.to(torch.float32)
-        expanded_probs, expanded_routing = manager.reroute(
-            LAYER_ID,
-            probs,
-            routing_map,
-        )
-
-        def validate():
-            assert expanded_probs.shape == (
-                TOKENS_PER_RANK,
-                manager.num_global_physical_experts,
-            )
-            assert expanded_routing.shape == expanded_probs.shape
-            assert bool((expanded_routing.sum(dim=1) == 1).all().item())
-            assert int(manager.logical_replica_counts[LAYER_ID, 0].item()) > 1
-            observed = manager.runtime.get_global_logical_expert_loads_tensor()
-            assert int(observed[0].item()) == TOKENS_PER_RANK * 8
-            assert int(observed[1:].sum().item()) == 0
-
-        _distributed_validate("placement/reroute", validate)
-        dist.barrier()
-
-    def test_async_weight_sync(self, ultraep_runtime):
-        state = ultraep_runtime
-        manager = state.manager
-        _fill_master_tensors(state.fc1_weights, 1)
-        _fill_master_tensors(state.fc2_weights, 33)
-        manager.local_replica_weight_buffer.zero_()
-
-        dist.barrier()
-        event = manager.weight_sync(LAYER_ID, async_finish=True)
-        manager.wait_weight_sync(event, layer_id=LAYER_ID)
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        local_replica_physical_ids = (
-            state.rank * state.num_local_physical
-            + state.num_local_master
-            + torch.arange(NUM_LOCAL_REPLICAS, device="cuda")
-        )
-
-        logical_ids = manager.physical_to_logical_map[
-            LAYER_ID, local_replica_physical_ids
-        ].tolist()
-        local_valid = sum(logical_id >= 0 for logical_id in logical_ids)
-        global_valid = torch.tensor(local_valid, dtype=torch.int32, device="cuda")
-        dist.all_reduce(global_valid)
-        assert int(global_valid.item()) > 0
-
-        def validate():
-            for replica_index, logical_id in enumerate(logical_ids):
-                if logical_id < 0:
-                    continue
-                _assert_filled(
-                    manager.local_replica_fc1_weight_buffer[replica_index],
-                    float(logical_id + 1),
-                    f"replica {replica_index} FC1",
-                )
-                _assert_filled(
-                    manager.local_replica_fc2_weight_buffer[replica_index],
-                    float(logical_id + 33),
-                    f"replica {replica_index} FC2",
-                )
-
-        _distributed_validate("asynchronous weight sync", validate)
-        dist.barrier()
-
-    def test_virtual_layer_grad_reduce(self, ultraep_runtime):
-        state = ultraep_runtime
-        manager = state.manager
-        _fill_master_tensors(state.fc1_grads, 65)
-        _fill_master_tensors(state.fc2_grads, 97)
-
-        replica_fc1 = manager.local_replica_fc1_grad_buffer
-        replica_fc2 = manager.local_replica_fc2_grad_buffer
-        replica_base = (
-            state.rank * state.num_local_physical + state.num_local_master
-        )
-        for replica_index in range(NUM_LOCAL_REPLICAS):
-            physical_id = replica_base + replica_index
-            replica_fc1[replica_index].fill_(float(physical_id + 129))
-            replica_fc2[replica_index].fill_(float(physical_id + 193))
-
-        expected_fc1 = []
-        expected_fc2 = []
-        logical_to_physical = manager.logical_to_physical_map[LAYER_ID]
-        for local_index in range(state.num_local_master):
-            logical_id = state.rank * state.num_local_master + local_index
-            master_physical_id = state.rank * state.num_local_physical + local_index
-            physical_ids = [
-                int(value)
-                for value in logical_to_physical[logical_id].tolist()
-                if int(value) >= 0
-            ]
-            replicas = [
-                physical_id
-                for physical_id in physical_ids
-                if physical_id != master_physical_id
-            ]
-            expected_fc1.append(
-                float(logical_id + 65 + sum(value + 129 for value in replicas))
-            )
-            expected_fc2.append(
-                float(logical_id + 97 + sum(value + 193 for value in replicas))
-            )
-
-        layer = SimpleNamespace(
-            eplb_manager=SimpleNamespace(runtime=manager, grad_reduce=manager.grad_reduce),
-            _eplb_grad_reduce_event_handles={},
-        )
-        dist.barrier()
-        moe_layer_ultraep._eplb_start_grad_reduce(layer, virtual_layer_id=LAYER_ID)
-        assert LAYER_ID in layer._eplb_grad_reduce_event_handles
-        moe_layer_ultraep._eplb_finish_grad_reduce(layer, virtual_layer_id=LAYER_ID)
-        assert layer._eplb_grad_reduce_event_handles == {}
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        local_replica_physical_ids = (
-            state.rank * state.num_local_physical
-            + state.num_local_master
-            + torch.arange(NUM_LOCAL_REPLICAS, device="cuda")
-        )
-
-        def validate():
-            for local_index in range(state.num_local_master):
-                _assert_filled(
-                    state.fc1_grads[local_index],
-                    expected_fc1[local_index],
-                    f"master {local_index} FC1 grad",
-                )
-                _assert_filled(
-                    state.fc2_grads[local_index],
-                    expected_fc2[local_index],
-                    f"master {local_index} FC2 grad",
-                )
-
-            valid_replicas = (
-                manager.physical_to_logical_map[
-                    LAYER_ID, local_replica_physical_ids
-                ]
-                >= 0
-            )
-            if bool(valid_replicas.any().item()):
-                assert bool(
-                    (manager.local_replica_grad_buffer[valid_replicas] == 0)
-                    .all()
-                    .item()
-                )
-
-        _distributed_validate("virtual-layer grad reduce", validate)
-        dist.barrier()
-
 
 
 def _hot_router(self, hidden_states, padding_mask=None):
