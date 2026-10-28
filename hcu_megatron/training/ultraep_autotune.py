@@ -18,6 +18,8 @@ def ultraep_autotune_train_step_wrapper(train_step_func):
     existing train_step directly.
     """
 
+    adaptive_state = {}
+
     @wraps(train_step_func)
     def wrapper(*args, **kwargs):
         # Import lazily so merely installing the patch does not initialize
@@ -30,8 +32,13 @@ def ultraep_autotune_train_step_wrapper(train_step_func):
         adaptive_managers = tuple(
             manager for manager in get_eplb_managers() if manager.adaptive_config is not None
         )
-        if adaptive_managers:
-            return _adaptive_train_step(train_step_func, adaptive_managers, args, kwargs)
+        # A pipeline stage with no MoE layers has no Manager, but must still
+        # join the WORLD timing/status reductions and follow the same policy.
+        config = kwargs.get('config', args[5] if len(args) > 5 else None)
+        if adaptive_managers or getattr(config, 'moe_ultraep_adaptive', False):
+            return _adaptive_train_step(
+                train_step_func, adaptive_managers, args, kwargs, adaptive_state, config,
+            )
 
         managers = get_collecting_eplb_managers()
         if not managers:
@@ -84,12 +91,19 @@ def _set_adaptive_mode(managers, active):
             manager.set_ultraep_active(active, synchronize=False)
 
 
-def _adaptive_train_step(train_step_func, managers, args, kwargs):
-    from .ultraep_adaptive import AdaptiveController
+def _adaptive_train_step(train_step_func, managers, args, kwargs, state, config):
+    from .ultraep_adaptive import AdaptiveConfig, AdaptiveController
 
-    controller = managers[0].adaptive_controller
+    controller = state.get('controller')
     if controller is None:
-        controller = AdaptiveController(managers[0].adaptive_config)
+        adaptive_config = managers[0].adaptive_config if managers else AdaptiveConfig(
+            samples=getattr(config, 'moe_ultraep_adaptive_samples', 3),
+            max_samples=getattr(config, 'moe_ultraep_adaptive_max_samples', 5),
+            min_speedup=getattr(config, 'moe_ultraep_adaptive_min_speedup', 0.01),
+            max_calibration_steps=getattr(config, 'moe_ultraep_adaptive_max_calibration_steps', 48),
+        )
+        controller = AdaptiveController(adaptive_config)
+        state['controller'] = controller
         for manager in managers:
             if manager.adaptive_config != controller.config:
                 raise RuntimeError('All UltraEP Managers must use the same adaptive configuration')

@@ -136,7 +136,7 @@ ULTRA_EP_GRAD_REDUCE_NUM_SMS
   3 组配对均胜出时提前启用；结果有分歧时补到最多 5 组，最终按中位收益决定。
 - 无效步不计入评分但消耗预算。预算耗尽时只使用完整配对；样本不足或收益
   未达门槛则选择 baseline，校准期间负载配置变化也回退 baseline。
-- 支持 TP1/PP1/CP1/ETP1、无 bias 的 BF16 TE SwiGLU grouped experts、alltoall，
+- 支持 TP/PP，要求 CP1/ETP1、无 bias 的 BF16 TE SwiGLU grouped experts、alltoall，
   要求开启梯度累积融合。不支持 EP overlap、CUDA graph、重计算、延迟 wgrad、
   shared-expert overlap、latent MoE、MTP 和 TE op fuser。
 - 未开启 UltraEP 时自动关闭 adaptive。校准结束后停止额外计时、同步和决策

@@ -171,8 +171,11 @@ class TestUltraEPFeature:
         assert args.moe_ultraep_autotune_start_iteration == 3
         assert args.moe_ultraep_autotune_grad_reduce_max_sms is None
 
-    def test_validate_accepts_supported_configuration(self):
-        args = _feature_args(moe_ultraep_adaptive=True, moe_ultraep_autotune_grad_reduce_max_sms=48)
+    @pytest.mark.parametrize('tp,pp', [(1, 1), (2, 1), (1, 2)])
+    def test_validate_accepts_supported_configuration(self, tp, pp):
+        args = _feature_args(moe_ultraep_adaptive=True, moe_ultraep_autotune_grad_reduce_max_sms=48,
+                             tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
+                             context_parallel_size=1)
         assert UltraEPFeature().validate_args(args) is args
 
     @pytest.mark.parametrize(
@@ -185,6 +188,8 @@ class TestUltraEPFeature:
             ({"cuda_graph_impl": "local"}, "CUDA graph capture"),
             ({"optimizer_cuda_graph": True}, "optimizer-cuda-graph"),
             ({"moe_ultraep_adaptive": True, "overlap_moe_expert_parallel_comm": True}, "EP overlap"),
+            ({"moe_ultraep_adaptive": True, "expert_tensor_parallel_size": 2}, "CP1 / ETP1"),
+            ({"moe_ultraep_adaptive": True, "context_parallel_size": 2}, "CP1 / ETP1"),
         ],
     )
     def test_validate_rejects_invalid_configuration(self, overrides, message):
@@ -266,6 +271,7 @@ class TestEPLBManager:
         monkeypatch.setattr(
             eplb_manager_module, "ultra_ep", ultra_ep or _fake_ultra_ep(), raising=False
         )
+        monkeypatch.setattr(eplb_manager_module.EPLBManager, '_prepare_peer_fence', lambda self: None)
         return eplb_manager_module.EPLBManager(config or _manager_config(), object())
 
     def test_constructs_counts_slots_and_runtime_buffers(self, monkeypatch):
@@ -351,6 +357,31 @@ class TestEPLBManager:
         manager.runtime.grad_reduce.assert_called_once_with(layer_id=7, async_finish=True)
         native.invalidate_weight_sync_task_cache.assert_called_once()
         manager._fence_on_comm_stream.assert_called_once_with(stream)
+
+    @pytest.mark.parametrize('bound_device', [None, 'cuda:0'])
+    def test_peer_group_initialization_only_requires_ep_members(self, monkeypatch, bound_device):
+        manager = eplb_manager_module.EPLBManager.__new__(eplb_manager_module.EPLBManager)
+        manager.group, manager.num_ranks = object(), 2
+        manager._peer_group = manager._replica_comm_stream = None
+        stream, peer_group = object(), object()
+        manager.runtime = SimpleNamespace(get_comm_stream=MagicMock(return_value=stream))
+        monkeypatch.setattr(dist, 'group', SimpleNamespace(WORLD=SimpleNamespace(bound_device_id=bound_device)))
+        split = MagicMock(return_value=peer_group)
+        create = MagicMock(return_value=peer_group)
+        monkeypatch.setattr(dist, 'split_group', split)
+        monkeypatch.setattr(dist, 'new_group', create)
+        monkeypatch.setattr(dist, 'get_process_group_ranks', lambda group: [2, 3])
+        monkeypatch.setattr(torch, 'zeros', MagicMock())
+        assert manager._prepare_peer_fence() is stream
+        assert manager._prepare_peer_fence() is stream
+        assert manager._peer_group is peer_group
+        manager.runtime.get_comm_stream.assert_called_once()
+        if bound_device is not None:
+            split.assert_called_once_with(parent_pg=manager.group, split_ranks=[[0, 1]])
+            create.assert_not_called()
+        else:
+            create.assert_called_once_with(ranks=[2, 3], use_local_synchronization=True)
+            split.assert_not_called()
 
 
 class TestDistributedParameterHandling:
@@ -956,7 +987,8 @@ class TestAutotuneTrainStep:
                 wrapped()
         manager.autotune_iteration_end.assert_not_called()
 
-    def test_adaptive_bridge_reuses_timer_and_stops_after_selection(self, monkeypatch):
+    @pytest.mark.parametrize('has_local_manager', [True, False])
+    def test_adaptive_bridge_reuses_timer_and_stops_after_selection(self, monkeypatch, has_local_manager):
         from hcu_megatron.training import ultraep_autotune as bridge
         from hcu_megatron.core.transformer.moe import eplb_manager
 
@@ -965,28 +997,35 @@ class TestAutotuneTrainStep:
             autotune_collecting=False, autotune_iteration_end=lambda elapsed: None,
         )
         manager.set_ultraep_active = lambda active, **kw: setattr(manager, 'ultraep_active', active)
-        monkeypatch.setattr(eplb_manager, 'get_eplb_managers', lambda: (manager,))
+        monkeypatch.setattr(eplb_manager, 'get_eplb_managers', lambda: (manager,) if has_local_manager else ())
         monkeypatch.setattr(bridge, '_adaptive_workload', lambda: (4096, 1, 4))
         tensor = torch.tensor
         monkeypatch.setattr(bridge.torch, 'tensor', lambda data, **kw: tensor(data, dtype=kw['dtype']))
-        monkeypatch.setattr(bridge.torch.distributed, 'all_reduce', lambda *args, **kw: None)
+        all_reduce = MagicMock()
+        monkeypatch.setattr(bridge.torch.distributed, 'all_reduce', all_reduce)
         monkeypatch.setattr(bridge.torch.distributed, 'get_rank', lambda: 1)
         clock = [0.0]
         monkeypatch.setattr(bridge.time, 'perf_counter', lambda: clock[0])
 
-        def step():
+        def step(config=None):
             clock[0] += 0.09 if manager.ultraep_active else 0.1
             return {}, False, False, False
 
         wrapped = bridge.ultraep_autotune_train_step_wrapper(step)
+        config = SimpleNamespace(moe_ultraep_adaptive=True)
         with patch.object(bridge.torch.cuda, 'synchronize') as synchronize:
-            while manager.adaptive_controller is None or not manager.adaptive_controller.complete:
-                wrapped()
-            assert manager.ultraep_active
-            assert manager.adaptive_controller.result['baseline_ms'] == pytest.approx(100)
+            for _ in range(17):
+                wrapped(config=config)
+            if has_local_manager:
+                assert manager.ultraep_active
+                assert manager.adaptive_controller.result['baseline_ms'] == pytest.approx(100)
+            else:
+                assert all_reduce.call_count > 0
             count = synchronize.call_count
-            wrapped()
+            collectives = all_reduce.call_count
+            wrapped(config=config)
             assert synchronize.call_count == count
+            assert all_reduce.call_count == collectives
 
 
 class TestUltraEPAdaptivePolicy:

@@ -133,9 +133,8 @@ class UltraEPFeature(AbstractFeature):
                 'UltraEP adaptive currently requires EP overlap to be disabled.'
             )
             assert all(getattr(args, name, 1) == 1 for name in (
-                'tensor_model_parallel_size', 'pipeline_model_parallel_size',
                 'context_parallel_size', 'expert_tensor_parallel_size',
-            )), 'UltraEP adaptive currently supports TP1 / PP1 / CP1 / ETP1.'
+            )), 'UltraEP adaptive currently requires CP1 / ETP1.'
             assert getattr(args, 'moe_token_dispatcher_type', 'alltoall') == 'alltoall', (
                 'UltraEP adaptive currently requires the alltoall dispatcher.'
             )

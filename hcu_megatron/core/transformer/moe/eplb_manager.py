@@ -180,6 +180,9 @@ class EPLBManager:
         self.local_replica_fc2_grad_buffer: torch.Tensor = (
             self.runtime.local_replica_fc2_grad_buffer
         )
+        # Finish communicator creation before PP can post receives. Creating
+        # it during the first UltraEP forward can block another pipeline stage.
+        self._prepare_peer_fence()
 
     @torch.no_grad()
     def update_placement(self, layer_id: int, routing_map: torch.Tensor):
@@ -218,10 +221,18 @@ class EPLBManager:
 
     def _prepare_peer_fence(self):
         if self._peer_group is None:
-            self._peer_group = torch.distributed.new_group(
-                ranks=torch.distributed.get_process_group_ranks(self.group),
-                use_local_synchronization=True,
-            )
+            if torch.distributed.group.WORLD.bound_device_id is not None:
+                # new_group would split WORLD when it has a bound device.
+                # Only this EP group's members may construct a MoE Manager
+                # (a different PP stage can contain no MoE layers).
+                self._peer_group = torch.distributed.split_group(
+                    parent_pg=self.group, split_ranks=[list(range(self.num_ranks))],
+                )
+            else:
+                self._peer_group = torch.distributed.new_group(
+                    ranks=torch.distributed.get_process_group_ranks(self.group),
+                    use_local_synchronization=True,
+                )
             self._peer_fence = torch.zeros(1, dtype=torch.int32, device='cuda')
         if self._replica_comm_stream is None:
             self._replica_comm_stream = self.runtime.get_comm_stream()
