@@ -77,8 +77,8 @@ class _EPLBWeightSyncFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         if ctx.moe_layer.eplb_manager is not None:
-            # HCU BLOCKER: calls ultra_ep._C weight_sync
-            ctx.moe_layer.eplb_manager.runtime.weight_sync(
+            # Synchronize replica weights before the expert backward pass.
+            ctx.moe_layer.eplb_manager.weight_sync(
                 layer_id=ctx.virtual_layer_id,
                 async_finish=False,
             )
@@ -135,6 +135,7 @@ def _eplb_register_redundant_experts(self):
                 f"weight{expert_idx} not found in {linear_module}"
             )
             setattr(master_weight, 'is_eplb_master', True)
+            master_weight._eplb_manager = self.eplb_manager
 
         # Point replica params at UltraEP's cross-layer shared buffers.
         # TEGroupedMLP allocates weight0..weight{num_local_master-1} during its
@@ -246,7 +247,7 @@ def _eplb_register_master_experts(self):
                 master_fc2_weights.append(master_weight.data)
                 master_fc2_grads.append(master_weight.main_grad)
 
-    # HCU BLOCKER: calls ultra_ep._C construct_local_master_ptr_pool
+    # Register master parameter addresses with the native UltraEP runtime.
     self.eplb_manager.runtime.construct_local_master_ptr_pool(
         layer_id=self.layer_number,
         fc1_weights=master_fc1_weights,
@@ -258,12 +259,12 @@ def _eplb_register_master_experts(self):
 
 
 def _eplb_start_grad_reduce(self, virtual_layer_id: int, async_finish: bool = True):
-    # HCU BLOCKER: calls ultra_ep._C grad_reduce
+    # Reduce replica gradients for the current virtual layer.
     assert virtual_layer_id not in self._eplb_grad_reduce_event_handles, (
         "UltraEP Grad Reduce was launched twice for one virtual layer"
     )
     self._eplb_grad_reduce_event_handles[virtual_layer_id] = (
-        self.eplb_manager.runtime.grad_reduce(
+        self.eplb_manager.grad_reduce(
             layer_id=virtual_layer_id,
             async_finish=async_finish,
         )
@@ -300,6 +301,21 @@ def _eplb_register_master_grad_ready(self):
 # ---------------------------------------------------------------------------
 # Init wrapper
 # ---------------------------------------------------------------------------
+
+def _capture_expert_execution_state(layer):
+    """Capture only execution metadata; never copy parameters or gradients."""
+    objects = [
+        (layer.experts, ('num_local_experts',)),
+        (layer.experts.linear_fc1, ('num_gemms',)),
+        (layer.experts.linear_fc2, ('num_gemms',)),
+    ]
+    for dispatcher in filter(None, [layer.token_dispatcher, getattr(layer, 'recompute_token_dispatcher', None)]):
+        objects.append((dispatcher, (
+            'num_local_experts', 'num_experts', 'local_expert_indices',
+            'sort_input_by_local_experts', 'restore_output_by_local_experts',
+        )))
+    return [(obj, {key: getattr(obj, key) for key in keys if hasattr(obj, key)}) for obj, keys in objects]
+
 
 def moe_layer_ultraep_init_wrapper(moe_layer_init_func):
     @wraps(moe_layer_init_func)
@@ -376,7 +392,13 @@ def moe_layer_ultraep_init_wrapper(moe_layer_init_func):
 
             # Phase 1: create replica weight params backed by UltraEP buffers
             # and extend linear_fc1/fc2.num_gemms to num_local_physical_experts.
+            adaptive = getattr(config, 'moe_ultraep_adaptive', False)
+            baseline_state = _capture_expert_execution_state(self) if adaptive else None
             self._eplb_register_redundant_experts()
+            if adaptive:
+                self.eplb_manager.register_adaptive_layer(
+                    self, baseline_state, _capture_expert_execution_state(self)
+                )
             # Phase 2 (_eplb_register_master_experts) called lazily after DDP init.
 
         else:
@@ -399,7 +421,7 @@ def moe_layer_ultraep_forward_wrapper(moe_layer_forward_func):
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
     ):
-        if not self.eplb_enabled:
+        if not self.eplb_enabled or not getattr(self.eplb_manager, 'ultraep_active', True):
             return moe_layer_forward_func(
                 self,
                 hidden_states=hidden_states,
@@ -410,6 +432,13 @@ def moe_layer_ultraep_forward_wrapper(moe_layer_forward_func):
         # Lazily finalize master pointer registration after DDP init.
         if not self._eplb_master_ptrs_registered:
             self._eplb_register_master_experts()
+
+        # Weight Sync reads master weights before TE's own forward pre-hook.
+        # Finish lazy optimizer all-gathers before peers can read those weights.
+        for linear in (self.experts.linear_fc1, self.experts.linear_fc2):
+            hook = getattr(linear.weight0, '_eplb_forward_pre_hook', None)
+            if hook is not None:
+                hook(linear)
 
         # Allocate virtual layer ID OUTSIDE custom_forward so activation
         # recompute re-uses the same slot.
@@ -434,9 +463,9 @@ def moe_layer_ultraep_forward_wrapper(moe_layer_forward_func):
 
             # Update replica placement and kick off async weight sync.
             self.eplb_manager.update_placement(virtual_layer_id, routing_map)
-            # HCU BLOCKER: calls ultra_ep._C weight_sync
+            # Start asynchronous replica weight synchronization.
             self._eplb_weight_sync_event_handle = (
-                self.eplb_manager.runtime.weight_sync(
+                self.eplb_manager.weight_sync(
                     layer_id=virtual_layer_id, async_finish=True
                 )
             )
